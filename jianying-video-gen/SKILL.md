@@ -27,6 +27,8 @@ pip install playwright && playwright install chromium
 
 ```bash
 python3 scripts/jianying_worker.py \
+  --cookies /path/to/cookies.json \
+  --output-dir /path/to/output \
   --prompt "赛博朋克风格的长安城，飞行汽车穿梭在霓虹灯笼之间" \
   --duration 10s \
   --model "Seedance 2.0"
@@ -36,6 +38,8 @@ python3 scripts/jianying_worker.py \
 
 ```bash
 python3 scripts/jianying_worker.py \
+  --cookies /path/to/cookies.json \
+  --output-dir /path/to/output \
   --ref-video /path/to/reference.mp4 \
   --prompt "画风改成宫崎骏风格，其他不变" \
   --duration 10s \
@@ -45,7 +49,7 @@ python3 scripts/jianying_worker.py \
 ### Dry-Run 模式（调试用）
 
 ```bash
-python3 scripts/jianying_worker.py --prompt "测试" --dry-run
+python3 scripts/jianying_worker.py --cookies /path/to/cookies.json --prompt "测试" --dry-run
 ```
 
 > 只填写表单不提交，生成 `step_*.png` 截图供检查。
@@ -59,6 +63,8 @@ python3 scripts/jianying_worker.py --prompt "测试" --dry-run
 | `--ratio` | `横屏` | `横屏`, `竖屏`, `方屏` | 画面比例 |
 | `--model` | `Seedance 2.0` | `Seedance 2.0`, `Seedance 2.0 Fast` | 模型选择 |
 | `--ref-video` | 无 | 本地视频路径 | V2V 模式的参考视频 |
+| `--cookies` | `cookies.json` | 文件路径 | 剪映登录凭证路径 |
+| `--output-dir` | `.` | 目录路径 | 输出视频保存目录 |
 | `--dry-run` | false | - | 只填表不提交 |
 
 ## 模型与积分

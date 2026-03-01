@@ -11,8 +11,8 @@ import html
 import argparse
 from playwright.async_api import async_playwright
 
-COOKIES_FILE = 'cookies.json'
-DOWNLOAD_DIR = '.'
+COOKIES_FILE = 'cookies.json'  # 可通过 --cookies 覆盖
+DOWNLOAD_DIR = '.'  # 可通过 --output-dir 覆盖
 
 def load_and_clean_cookies():
     with open(COOKIES_FILE, 'r') as f:
@@ -555,8 +555,14 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="Seedance 2.0",
                         choices=["Seedance 2.0", "Seedance 2.0 Fast"])
     parser.add_argument("--ref-video", type=str, default=None, help="Reference video file path (V2V mode)")
+    parser.add_argument("--cookies", type=str, default="cookies.json", help="Path to cookies.json")
+    parser.add_argument("--output-dir", type=str, default=".", help="Directory to save output video")
     parser.add_argument("--dry-run", action="store_true", help="Only fill form, don't submit")
     args = parser.parse_args()
+
+    COOKIES_FILE = args.cookies
+    DOWNLOAD_DIR = args.output_dir
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
     if not os.path.exists(COOKIES_FILE):
         print(f"⚠️ {COOKIES_FILE} not found!")
