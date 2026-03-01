@@ -1,8 +1,7 @@
 """
-小云雀 (Jianying) 自动化视频生成 v4
+小云雀 (Jianying) 自动化视频生成 v5
 引擎: Playwright + Chromium
-核心改进: 所有 UI 交互改用 Playwright locator.click() (模拟真实鼠标事件)，
-         不再用 evaluate + element.click() (会被 React 忽略)
+支持: 文生视频 (T2V) + 参考视频生成 (V2V)
 """
 import asyncio
 import json
@@ -33,7 +32,11 @@ def load_and_clean_cookies():
         cleaned.append(clean)
     return cleaned
 
+DEBUG_SCREENSHOTS = False  # 由 --dry-run 控制
+
 async def screenshot(page, name):
+    if not DEBUG_SCREENSHOTS:
+        return
     path = os.path.join(DOWNLOAD_DIR, f'step_{name}.png')
     await page.screenshot(path=path)
     print(f"  📸 Screenshot: {path}")
@@ -52,8 +55,17 @@ async def safe_click(page, locator_or_selector, label, timeout=5000):
         print(f"  ❌ {label}: {e}")
         return False
 
-async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: str = "Seedance 2.0", dry_run: bool = False):
-    print("🚀 Starting Playwright + Chromium (headless)...")
+async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: str = "Seedance 2.0", dry_run: bool = False, ref_video: str = None):
+    global DEBUG_SCREENSHOTS
+    DEBUG_SCREENSHOTS = dry_run
+    mode_label = "V2V (参考视频)" if ref_video else "T2V (文生视频)"
+    print(f"🚀 Starting Playwright + Chromium (headless)... [{mode_label}]")
+    if ref_video and not os.path.exists(ref_video):
+        print(f"❌ 参考视频文件不存在: {ref_video}")
+        return
+    if ref_video:
+        size_mb = os.path.getsize(ref_video) / (1024 * 1024)
+        print(f"📎 参考视频: {ref_video} ({size_mb:.1f}MB)")
     if dry_run:
         print("⚠️ DRY-RUN MODE: will fill form but NOT click '开始创作'")
 
@@ -216,29 +228,156 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
             await page.wait_for_timeout(1500)
         await screenshot(page, '5b_model_selected')
 
-        # === Step 6: 选时长 ===
-        print(f"⏱️ [Step 6] Selecting duration: {duration}...")
+        # === Step 6: 上传参考视频 (仅 V2V 模式) ===
+        if ref_video:
+            print(f"📎 [Step 6] Uploading reference video: {os.path.basename(ref_video)}")
+
+            # 6a: 点击工具栏的 "参考" 按钮 → 弹出面板
+            # "参考" 文字可能在多处出现，用坐标限制到工具栏区域 (y>370)
+            ref_click_result = await page.evaluate('''() => {
+                const items = Array.from(document.querySelectorAll('*'));
+                const btn = items.find(el => {
+                    const text = el.innerText && el.innerText.trim();
+                    if (text !== '参考') return false;
+                    const rect = el.getBoundingClientRect();
+                    // 工具栏区域: y > 370, 小元素
+                    return rect.top > 370 && el.offsetHeight < 50 && el.offsetHeight > 10;
+                });
+                if (btn) {
+                    btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
+                    btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true}));
+                    btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+                    const r = btn.getBoundingClientRect();
+                    return 'OK (x=' + Math.round(r.left) + ', y=' + Math.round(r.top) + ')';
+                }
+                return 'NOT_FOUND';
+            }''')
+            ref_clicked = 'OK' in ref_click_result
+            print(f"  参考按钮: {ref_click_result}")
+            await page.wait_for_timeout(3000)
+            await screenshot(page, '6a_ref_panel')
+
+            if ref_clicked:
+                # 6b: 在弹出面板中点击 "从本地上传" 链接
+                # 面板结构:
+                #   输入框: "请输入参考内容链接或从本地上传"
+                #   描述: "仅支持抖音、头条、西瓜，你也可以 [从本地上传]"  ← 紫色链接
+                #   按钮: [确认]
+                try:
+                    async with page.expect_file_chooser(timeout=10000) as fc_info:
+                        # 精确点击 "从本地上传" 链接 (紫色文字，在描述行中)
+                        upload_clicked = await page.evaluate('''() => {
+                            // 方式1: 找精确匹配 "从本地上传" 的元素 (最小的那个，即链接本身)
+                            const all = Array.from(document.querySelectorAll('*'));
+                            const candidates = all.filter(el => {
+                                const text = el.innerText && el.innerText.trim();
+                                if (!text) return false;
+                                // 精确匹配: 文本就是 "从本地上传" (不含其他文字)
+                                if (text === '从本地上传') return true;
+                                return false;
+                            });
+                            // 按元素大小排序，取最小的 (最精确的)
+                            candidates.sort((a, b) => {
+                                return (a.offsetWidth * a.offsetHeight) - (b.offsetWidth * b.offsetHeight);
+                            });
+                            if (candidates.length > 0) {
+                                const el = candidates[0];
+                                el.click();
+                                return 'OK_link: ' + el.tagName;
+                            }
+                            return 'NOT_FOUND';
+                        }''')
+                        print(f"  从本地上传: {upload_clicked}")
+                        if upload_clicked == 'NOT_FOUND':
+                            raise Exception("'从本地上传' link not found in popup")
+
+                    file_chooser = await fc_info.value
+                    await file_chooser.set_files(ref_video)
+                    print(f"  ✅ 文件已选择: {os.path.basename(ref_video)}")
+
+                    # 等待上传: 弹窗会显示上传进度，完成后弹窗关闭，页面出现缩略图
+                    print("  ⏳ 等待上传完成...")
+                    for wait_i in range(60):  # 最多等 300 秒
+                        await page.wait_for_timeout(5000)
+
+                        upload_status = await page.evaluate('''() => {
+                            // 检测1: 弹窗是否还在 (如果弹窗关闭了大概率上传完成)
+                            const popup = document.querySelector('[class*="modal"], [class*="dialog"], [role="dialog"]');
+                            const hasConfirmBtn = !!Array.from(document.querySelectorAll('*')).find(el =>
+                                el.innerText && el.innerText.trim() === '确认' &&
+                                el.offsetHeight < 50 && el.offsetHeight > 15
+                            );
+
+                            // 检测2: 视频缩略图元素是否出现 (带 video 标签或 img)
+                            const inputArea = document.querySelector('div[contenteditable="true"]');
+                            const hasThumb = inputArea ?
+                                (inputArea.parentElement.querySelector('video') !== null ||
+                                 inputArea.parentElement.querySelector('img[src*="tos"]') !== null) :
+                                false;
+
+                            // 检测3: 是否有上传进度指示
+                            const html = document.body.innerHTML;
+                            const isUploading = html.includes('上传中') || html.includes('uploading');
+
+                            if (hasThumb) return 'DONE';
+                            if (isUploading) return 'UPLOADING';
+                            if (!hasConfirmBtn && !popup) return 'POPUP_CLOSED';
+                            return 'WAITING';
+                        }''')
+
+                        if upload_status == 'DONE':
+                            print(f"  ✅ 上传完成! 缩略图已出现 (elapsed: {(wait_i+1)*5}s)")
+                            break
+                        elif upload_status == 'POPUP_CLOSED':
+                            print(f"  ✅ 弹窗已关闭 (elapsed: {(wait_i+1)*5}s)")
+                            break
+                        elif upload_status == 'UPLOADING':
+                            print(f"    ⏳ 上传中... ({(wait_i+1)*5}s)")
+                        elif wait_i > 0 and wait_i % 6 == 0:
+                            print(f"    ⏳ 等待中... ({(wait_i+1)*5}s)")
+
+                    # 如果弹窗还开着，尝试关闭 (点 X 按钮)
+                    await page.evaluate('''() => {
+                        // 找 X 关闭按钮
+                        const closeBtn = document.querySelector('[class*="close"], [aria-label="close"], [aria-label="关闭"]');
+                        if (closeBtn) { closeBtn.click(); return; }
+                        // 找确认按钮
+                        const all = Array.from(document.querySelectorAll('*'));
+                        const confirm = all.find(el => el.innerText && el.innerText.trim() === '确认'
+                            && el.offsetHeight < 50 && el.offsetHeight > 15);
+                        if (confirm) confirm.click();
+                    }''')
+                    await page.wait_for_timeout(2000)
+
+                except Exception as e:
+                    print(f"  ❌ 参考视频上传失败: {e}")
+
+            await page.wait_for_timeout(2000)
+            await screenshot(page, '6b_ref_uploaded')
+
+        # === Step 7: 选时长 ===
+        step7_label = '7' if ref_video else '6'
+        print(f"⏱️ [Step {step7_label}] Selecting duration: {duration}...")
         
-        # 6a: 点击当前时长按钮 (显示 "5s"、"10s" 或 "15s")
+        # 点击当前时长按钮 (显示 "5s"、"10s" 或 "15s")
         dur_btn = page.locator('text=/^\\d+s$/').first
         dur_opened = await safe_click(page, dur_btn, '时长按钮')
         await page.wait_for_timeout(1500)
-        await screenshot(page, '6a_duration_dropdown')
+        await screenshot(page, f'{step7_label}a_duration_dropdown')
 
         if dur_opened:
-            # 6b: 在下拉中选择目标时长
             try:
-                # 精确匹配目标时长
                 dur_item = page.locator(f'text=/^{duration}$/').first
                 await dur_item.click(timeout=3000)
                 print(f"  ✅ 时长选择: {duration}")
             except Exception as e:
                 print(f"  ⚠️ 时长选择: {e}")
             await page.wait_for_timeout(1000)
-        await screenshot(page, '6b_duration_selected')
+        await screenshot(page, f'{step7_label}b_duration_selected')
 
-        # === Step 7: 注入 Prompt ===
-        print(f"📝 [Step 7] Injecting prompt: {prompt}")
+        # === Step 8: 注入 Prompt ===
+        step8_label = '8' if ref_video else '7'
+        print(f"📝 [Step {step8_label}] Injecting prompt: {prompt}")
         inject_result = await page.evaluate('''([text]) => {
             const el = document.querySelector('div[contenteditable="true"]');
             if (el) {
@@ -250,7 +389,7 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
         }''', [prompt])
         print(f"  Inject: {inject_result}")
         await page.wait_for_timeout(1000)
-        await screenshot(page, '7_prompt')
+        await screenshot(page, f'{step8_label}_prompt')
 
         # === Step 8: 验证/提交 ===
         if dry_run:
@@ -269,9 +408,47 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
             await browser.close()
             return
 
+        # === Step 8: 设置 thread_id 拦截器 + 提交 ===
+        thread_id = None
+        async def sniff_thread(response):
+            nonlocal thread_id
+            if thread_id:
+                return
+            try:
+                text = await response.text()
+                if 'thread_id' in text:
+                    import json as _json
+                    # 尝试从 JSON 中提取 thread_id
+                    data = _json.loads(text)
+                    # thread_id 可能在不同层级
+                    tid = None
+                    if isinstance(data, dict):
+                        tid = data.get('thread_id') or data.get('data', {}).get('thread_id')
+                        if not tid and 'data' in data:
+                            d = data['data']
+                            if isinstance(d, dict):
+                                tid = d.get('thread_id')
+                                # 可能嵌套更深
+                                for v in d.values():
+                                    if isinstance(v, dict) and 'thread_id' in v:
+                                        tid = v['thread_id']
+                                        break
+                    if not tid:
+                        # 暴力正则
+                        m = re.search(r'"thread_id"\s*:\s*"([^"]+)"', text)
+                        if m:
+                            tid = m.group(1)
+                    if tid:
+                        thread_id = tid
+                        print(f"\n  🎯 Sniffed thread_id: {tid}")
+            except Exception:
+                pass
+
+        page.on('response', sniff_thread)
+
         print("🖱️ [Step 8] Clicking '开始创作'...")
         submit_clicked = await safe_click(page, page.locator('text=开始创作').first, '开始创作')
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(5000)
         await screenshot(page, '8_submitted')
 
         if not submit_clicked:
@@ -279,20 +456,65 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
             await browser.close()
             return
 
-        # === Step 9: 轮询 MP4 ===
-        print("⏳ [Step 9] Polling for MP4 link (up to 10 min)...")
+        # 等待 thread_id 被拦截
+        for _ in range(10):
+            if thread_id:
+                break
+            await page.wait_for_timeout(2000)
+
+        if not thread_id:
+            print("  ⚠️ thread_id not captured from responses, trying page HTML...")
+            page_html = await page.content()
+            m = re.search(r'thread_id["\s:=]+([0-9a-f-]{36})', page_html)
+            if m:
+                thread_id = m.group(1)
+                print(f"  🎯 Found thread_id in HTML: {thread_id}")
+
+        if not thread_id:
+            print("  ❌ Could not get thread_id. Aborting.")
+            await browser.close()
+            return
+
+        # === Step 9: 导航到 thread 详情页 + 轮询视频 ===
+        detail_url = f"https://xyq.jianying.com/home?tab_name=integrated-agent&thread_id={thread_id}"
+        print(f"🔗 [Step 9] Navigating to thread detail page...")
+        print(f"  URL: {detail_url}")
+        await page.goto(detail_url, wait_until='domcontentloaded')
+        await page.wait_for_timeout(8000)
+
+        safe_name = ''.join(c for c in prompt[:15] if c.isalnum() or c in '_ ')
+        filename = f"{safe_name}_{duration}.mp4"
+        filepath = os.path.join(DOWNLOAD_DIR, filename)
+
+        print("⏳ Polling for video on detail page...")
         mp4_url = None
         for i in range(120):
             await page.wait_for_timeout(5000)
-            page_html = await page.content()
-            links = re.findall(r'https?:\/\/[^"\'\s\\]+\.mp4[^"\'\s\\]*', page_html)
-            if links:
-                mp4_url = html.unescape(links[0])
+
+            # 双通道提取: DOM + 正则
+            mp4_url = await page.evaluate('''() => {
+                // 通道1: <video> 标签 src
+                const v = document.querySelector('video');
+                if (v && v.src && v.src.includes('.mp4')) return v.src;
+                const s = document.querySelector('video source');
+                if (s && s.src && s.src.includes('.mp4')) return s.src;
+                // 通道2: 暴力正则
+                const html = document.documentElement.innerHTML;
+                const m = html.match(/https?:\/\/[^"'\\s\\\\]+\.mp4[^"'\\s\\\\]*/);
+                return m ? m[0] : null;
+            }''')
+
+            if mp4_url:
+                mp4_url = html.unescape(mp4_url)
                 print(f"\n  🎉 Found MP4 at attempt {i+1}!")
                 print(f"  🔗 {mp4_url[:120]}...")
                 break
+
             if i % 12 == 0 and i > 0:
                 print(f"  ⏳ Still generating... ({i*5}s elapsed)")
+                # 刷新详情页
+                await page.reload(wait_until='domcontentloaded')
+                await page.wait_for_timeout(5000)
             print(".", end="", flush=True)
 
         if not mp4_url:
@@ -301,57 +523,25 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
             await browser.close()
             return
 
-        # === Step 10: 下载 ===
-        # 用 Playwright 的 context.request API (自动共享浏览器 cookies/session)
-        safe_name = ''.join(c for c in prompt[:15] if c.isalnum() or c in '_ ')
-        filename = f"{safe_name}_{duration}.mp4"
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
+        await screenshot(page, '9_video_ready')
+
+        # === Step 10: curl 下载 ===
         print(f"📥 [Step 10] Downloading to {filepath}...")
+        import subprocess
+        result = subprocess.run(
+            ['curl', '-L', '-o', filepath, '-s', '-w', '%{http_code}', mp4_url],
+            capture_output=True, text=True, timeout=120
+        )
+        http_code = result.stdout.strip()
 
-        try:
-            # 方法1: Playwright API request (共享浏览器 session)
-            api_resp = await context.request.get(mp4_url, headers={
-                "Referer": "https://xyq.jianying.com/",
-            })
-            if api_resp.ok:
-                body = await api_resp.body()
-                with open(filepath, 'wb') as f:
-                    f.write(body)
-                size_mb = len(body) / (1024 * 1024)
-                print(f"  ✅ Saved: {os.path.abspath(filepath)} ({size_mb:.1f}MB)")
-            else:
-                raise Exception(f"API request failed: status={api_resp.status}")
-        except Exception as e:
-            print(f"  ⚠️ Playwright API download failed: {e}")
-            # 方法2: 在浏览器页面内用 fetch() 下载 (完全同源)
-            print("  🔄 Trying in-page fetch()...")
-            try:
-                b64_data = await page.evaluate('''async (url) => {
-                    const resp = await fetch(url, {
-                        headers: { 'Referer': 'https://xyq.jianying.com/' }
-                    });
-                    if (!resp.ok) return 'FETCH_FAILED:' + resp.status;
-                    const blob = await resp.blob();
-                    return new Promise((resolve) => {
-                        const reader = new FileReader();
-                        reader.onload = () => resolve(reader.result);
-                        reader.readAsDataURL(blob);
-                    });
-                }''', mp4_url)
-
-                if b64_data.startswith('FETCH_FAILED'):
-                    raise Exception(b64_data)
-
-                import base64
-                # data:video/mp4;base64,XXXX...
-                raw = base64.b64decode(b64_data.split(',', 1)[1])
-                with open(filepath, 'wb') as f:
-                    f.write(raw)
-                size_mb = len(raw) / (1024 * 1024)
-                print(f"  ✅ Saved via fetch: {os.path.abspath(filepath)} ({size_mb:.1f}MB)")
-            except Exception as e2:
-                print(f"  ❌ All download methods failed: {e2}")
-                print(f"  📋 Manual link: {mp4_url}")
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 10000:
+            size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            print(f"  ✅ Saved: {os.path.abspath(filepath)} ({size_mb:.1f}MB) [HTTP {http_code}]")
+        else:
+            print(f"  ❌ Download failed: HTTP {http_code}")
+            if result.stderr:
+                print(f"  Error: {result.stderr[:200]}")
+            print(f"  📋 Manual link: {mp4_url}")
 
         await browser.close()
 
@@ -364,10 +554,11 @@ if __name__ == "__main__":
     parser.add_argument("--ratio", type=str, default="横屏", choices=["横屏", "竖屏", "方屏"])
     parser.add_argument("--model", type=str, default="Seedance 2.0",
                         choices=["Seedance 2.0", "Seedance 2.0 Fast"])
+    parser.add_argument("--ref-video", type=str, default=None, help="Reference video file path (V2V mode)")
     parser.add_argument("--dry-run", action="store_true", help="Only fill form, don't submit")
     args = parser.parse_args()
 
     if not os.path.exists(COOKIES_FILE):
         print(f"⚠️ {COOKIES_FILE} not found!")
     else:
-        asyncio.run(run(args.prompt, args.duration, args.ratio, args.model, args.dry_run))
+        asyncio.run(run(args.prompt, args.duration, args.ratio, args.model, args.dry_run, args.ref_video))

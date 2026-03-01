@@ -1,0 +1,19 @@
+# Debug files
+step_*.png
+test_*.py
+test_*.mp4
+
+# Generated videos
+*.mp4
+
+# Cookies (sensitive)
+cookies.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Old scripts
+camoufox_worker.py
+playwright_worker.py
+debug_test.py
