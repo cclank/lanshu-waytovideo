@@ -28,9 +28,34 @@
 | 📥 **自动下载** | 通过 thread_id 详情页提取 CDN 链接，curl 直接下载 |
 | 🔐 **Cookie 登录** | 免密登录，支持自定义 cookies 路径 |
 | 🧪 **Dry-Run 调试** | 填写表单但不提交，生成截图供检查 |
-| 🤖 **AI Agent Skill** | 标准 Skill 格式，可被 AI Agent 直接调用 |
+| � **Dry-Run 调试** | 填写表单但不提交，生成截图供检查 |
+| �🤖 **AI Agent Skill** | 标准 Skill 格式，完美兼容 OpenClaw、Claude Code 等 Agent 框架 |
 
-## 🚀 快速开始
+## 🚀 快速开始 (作为 AI Agent Skill)
+
+本项目主要设计为 AI Agent 的扩展技能（Skill），让 LLM 获得自动化生成视频的能力。
+
+### 1. 准备 Cookies
+
+由于剪映网页版需要登录，你需要先在本地浏览器获取登录状态：
+1. 在浏览器中登录 [xyq.jianying.com](https://xyq.jianying.com)
+2. 使用 [EditThisCookie](https://chrome.google.com/webstore/detail/editthiscookie) 等扩展导出 cookies
+3. 将文件保存为 `cookies.json` 放置在 Agent 运行目录下。
+
+### 2. 在 OpenClaw / Claude Code 中使用
+
+直接让 Agent 挂载 `jianying-video-gen` 目录即可。当你在对话中输入以下 prompt 时，Agent 就会自动调用该技能：
+
+> **User**: "帮我生成一段赛博朋克风格的视频，10秒横屏。"
+> **OpenClaw/Claude**: (自动分析意图 -> 识别出需要视频生成 -> 隐式调用 `jianying_worker.py` -> 自动轮询 -> 最终返回已下载好的 mp4 文件路径给你)
+
+*注意：Agent 运行环境需已安装 Python 3.9+、`playwright` 并执行过 `playwright install chromium`。*
+
+---
+
+## 💻 命令行手动调用 (开发者测试)
+
+如果你想自己写代码或通过终端手动测试生成流程，可以按以下方式执行：
 
 ### 安装依赖
 
@@ -38,12 +63,6 @@
 pip install playwright
 playwright install chromium
 ```
-
-### 准备 Cookies
-
-1. 在浏览器中登录 [xyq.jianying.com](https://xyq.jianying.com)
-2. 使用 [EditThisCookie](https://chrome.google.com/webstore/detail/editthiscookie) 等扩展导出 cookies
-3. 保存为 `cookies.json`
 
 ### ▶️ 文生视频 (T2V)
 
@@ -155,30 +174,17 @@ graph LR
 
 ## 📁 项目结构
 
-```
+```text
 lanshu-waytovideo/
 ├── cookies.json                    # 登录凭证 (需自行导出，勿提交)
 ├── README.md                       # 使用说明
 └── jianying-video-gen/             # AI Agent Skill 主目录
-    ├── SKILL.md                    # 技能说明文档
+    ├── SKILL.md                    # Agent 识别用的技能说明文档
     ├── requirements.txt            # Python 依赖
     ├── scripts/
-    │   └── jianying_worker.py      # 主发版自动化脚本
+    │   └── jianying_worker.py      # 自动化执行的 Python 入口
     └── references/
-        └── prompt-guide.md         # 提示词编写指南
-```
-
-## 🤖 作为 AI Agent Skill 使用
-
-将 `jianying-video-gen/` 目录放入 Agent 框架的 skills 目录即可。Agent 看到"生成视频"、"Seedance"、"剪映"等关键词时会自动触发此技能。
-
-```bash
-# Agent 调用示例
-python3 jianying-video-gen/scripts/jianying_worker.py \
-  --cookies /absolute/path/to/cookies.json \
-  --output-dir /absolute/path/to/output \
-  --prompt "你的视频描述" \
-  --duration 10s
+        └── prompt-guide.md         # 提供给 Agent 学习的提示词指南
 ```
 
 ## ⚠️ 注意事项
