@@ -17,3 +17,5 @@ __pycache__/
 camoufox_worker.py
 playwright_worker.py
 debug_test.py
+
+jianying_automation_plan.md
