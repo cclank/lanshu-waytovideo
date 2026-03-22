@@ -78,7 +78,10 @@ npx skills add https://github.com/cclank/lanshu-waytovideo --skill jianying-vide
 ```bash
 pip install playwright
 playwright install chromium
+brew install ffmpeg
 ```
+
+`V2V` 模式依赖 `ffprobe` 读取原视频尺寸，依赖 `ffmpeg` 在上传前做缩放/补边预处理。
 
 ### ▶️ 文生视频 (T2V)
 
@@ -105,7 +108,7 @@ python3 jianying-video-gen/scripts/jianying_worker.py \
 python3 jianying-video-gen/scripts/jianying_worker.py \
   --ref-video ./reference.mp4 \
   --prompt "画风改成宫崎骏风格，其他不变" \
-  --duration 10s \
+  --duration 5s \
   --model "Seedance 2.0"
 ```
 
@@ -123,6 +126,20 @@ python3 jianying-video-gen/scripts/jianying_worker.py \
 | `--output-dir` | `.` | 目录路径 | 视频输出目录 |
 | `--dry-run` | `false` | — | 仅填表不提交 |
 
+`V2V + --dry-run` 会额外打印一段 `表单状态` JSON。判断是否跑通，重点看这两点：
+- `hasVideoThumb` / `hasImageThumb` / `hasCanvasThumb` / `hasBackgroundThumb` / `hasReplaceAction` 至少一个为 `true`
+- `sendDisabled` 最好为 `false`，否则页面通常还没接受当前参考视频或 Prompt
+
+## 🎞️ V2V 预处理
+
+剪映/小云雀对参考视频分辨率有限制，参考视频需落在 `640×640（480p）- 834×1112（720p）` 对应范围内。脚本在上传前会：
+
+1. 用 `ffprobe` 读取原视频分辨率
+2. 如果长边超过 `1112`，先等比缩小
+3. 如果缩小后短边小于 `480`，再用 `ffmpeg pad` 补边到合法尺寸
+
+例如 `1472x632` 会被处理为 `1112x476`，最终补边到 `1112x480` 再上传。
+
 ## 💰 模型与积分
 
 | 模型 | 积分/秒 | 5s | 10s | 15s | 推荐场景 |
@@ -138,15 +155,17 @@ graph LR
     B --> C[🎬 沉浸式短片]
     C --> D[🤖 选模型]
     D --> E{V2V?}
-    E -->|是| F[📎 上传参考视频]
-    E -->|否| G[⏱️ 选时长]
-    F --> G
-    G --> H[💬 输入Prompt]
-    H --> I[🚀 提交生成]
-    I --> J[🎯 拦截 thread_id]
-    J --> K[📄 导航详情页]
-    K --> L[⏳ 轮询视频]
-    L --> M[📥 curl 下载 MP4]
+    E -->|是| F[📎 点击参考]
+    F --> G[🧰 ffprobe/ffmpeg 预处理]
+    G --> H[📤 上传参考视频]
+    E -->|否| I[⏱️ 选时长]
+    H --> I
+    I --> J[💬 输入Prompt]
+    J --> K[🚀 提交生成]
+    K --> L[🎯 拦截 thread_id]
+    L --> M[📄 导航详情页]
+    M --> N[⏳ 轮询视频]
+    N --> O[📥 curl 下载 MP4]
 ```
 
 ## 🎨 提示词示例
@@ -207,8 +226,9 @@ lanshu-waytovideo/
 
 - Cookies 有时效性，过期后需重新导出
 - 生成视频消耗积分，建议先用 `Fast` + `5s` 测试
-- 参考视频上传可能需要 60-90 秒，脚本会自动等待
-- 视频生成通常需要 3-5 分钟，脚本最多等待 10 分钟
+- `V2V` 不是走左侧 `+` 上传，而是走工具栏里的 `参考` 按钮
+- 参考视频上传可能需要 60-90 秒，平台校验较慢时更久
+- 视频生成通常需要 3-5 分钟，脚本目前最多等待约 20 分钟
 
 ---
 

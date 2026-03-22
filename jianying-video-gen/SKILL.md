@@ -65,6 +65,7 @@ python3 scripts/jianying_worker.py --cookies /path/to/cookies.json --prompt "测
 ```
 
 > 只填写表单不提交，生成 `step_*.png` 截图供检查。
+> 对 V2V 来说，dry-run 现在还会输出一段 `表单状态` JSON，用来确认参考视频缩略图是否已挂上、发送按钮是否已解锁。
 
 ## 参数说明
 
@@ -90,7 +91,7 @@ python3 scripts/jianying_worker.py --cookies /path/to/cookies.json --prompt "测
 ## 自动化流程
 
 ```
-登录(cookies) → 新建 → 沉浸式短片 → 选模型 → [上传参考视频] → 选时长 → 输入Prompt → 提交
+登录(cookies) → 选模式(沉浸式短片) → 选模型 → [上传参考素材] → 选时长 → 输入Prompt → 发送
   → 拦截 thread_id → 导航详情页 → 轮询视频 → curl 下载 MP4
 ```
 

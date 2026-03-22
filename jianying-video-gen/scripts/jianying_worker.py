@@ -9,6 +9,10 @@ import re
 import os
 import html
 import argparse
+import subprocess
+import shutil
+import tempfile
+from pathlib import Path
 from playwright.async_api import async_playwright
 
 COOKIES_FILE = 'cookies.json'  # 可通过 --cookies 覆盖
@@ -41,6 +45,76 @@ async def screenshot(page, name):
     await page.screenshot(path=path)
     print(f"  📸 Screenshot: {path}")
 
+async def check_and_resize_video(video_path: str) -> str:
+    """检查视频分辨率，必要时缩放并补边到平台要求范围内。"""
+    try:
+        # 获取分辨率
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", video_path]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            print(f"  ⚠️ 无法获取视频分辨率: {stderr.decode()}")
+            return video_path
+        
+        dims = stdout.decode().strip().split('x')
+        if len(dims) != 2:
+            return video_path
+        
+        w, h = int(dims[0]), int(dims[1])
+        print(f"  📊 原始视频分辨率: {w}x{h}")
+        
+        # 平台限制: 480p (640x640) - 720p (834x1112)
+        # 我们以长边不超过 1112 为准进行等比例缩放
+        max_dim = 1112
+        min_dim = 480
+        
+        need_resize = max(w, h) > max_dim or min(w, h) < min_dim
+
+        if need_resize:
+            scale_ratio = min(1.0, max_dim / max(w, h)) if max(w, h) > max_dim else 1.0
+            scaled_w = max(2, int(round(w * scale_ratio)))
+            scaled_h = max(2, int(round(h * scale_ratio)))
+            if scaled_w % 2 != 0:
+                scaled_w -= 1
+            if scaled_h % 2 != 0:
+                scaled_h -= 1
+
+            pad_w = max(scaled_w, min_dim)
+            pad_h = max(scaled_h, min_dim)
+            if pad_w % 2 != 0:
+                pad_w += 1
+            if pad_h % 2 != 0:
+                pad_h += 1
+
+            filter_parts = [f"scale={scaled_w}:{scaled_h}"]
+            if pad_w != scaled_w or pad_h != scaled_h:
+                pad_x = max((pad_w - scaled_w) // 2, 0)
+                pad_y = max((pad_h - scaled_h) // 2, 0)
+                filter_parts.append(f"pad={pad_w}:{pad_h}:{pad_x}:{pad_y}:black")
+
+            filter_chain = ",".join(filter_parts)
+            print(f"  🔧 视频将处理为 {scaled_w}x{scaled_h}，最终画布 {pad_w}x{pad_h}")
+
+            temp_dir = tempfile.gettempdir()
+            output_path = os.path.join(temp_dir, f"resized_{os.path.basename(video_path)}")
+            
+            ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", filter_chain, "-c:v", "libx264", "-crf", "23", "-preset", "fast", output_path]
+            print(f"  🎬 执行缩放: {' '.join(ffmpeg_cmd)}")
+            
+            f_proc = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            await f_proc.communicate()
+            
+            if f_proc.returncode == 0:
+                print(f"  ✅ 缩放完成: {output_path}")
+                return output_path
+            else:
+                print(f"  ❌ 缩放失败，忽略并使用原文件")
+                
+    except Exception as e:
+        print(f"  ⚠️ 预检查发生错误: {str(e)}")
+        
+    return video_path
+
 async def safe_click(page, locator_or_selector, label, timeout=5000):
     """用 Playwright locator.click() 点击元素，模拟真实鼠标事件"""
     try:
@@ -55,9 +129,167 @@ async def safe_click(page, locator_or_selector, label, timeout=5000):
         print(f"  ❌ {label}: {e}")
         return False
 
+async def open_reference_material_panel(page) -> bool:
+    """打开 V2V 的参考素材面板，必须优先走工具栏里的“参考”按钮。"""
+    selectors = [
+        ('button:has-text("参考")', '参考'),
+        ('button:has-text("素材")', '素材'),
+        ('button[title="上传参考素材"]', '上传参考素材'),
+    ]
+    for selector, label in selectors:
+        if await safe_click(page, page.locator(selector).first, f'{label}按钮', timeout=8000):
+            return True
+
+    fallback = await page.evaluate('''() => {
+        const editable = document.querySelector('div[contenteditable="true"]');
+        const root = editable ? (editable.closest('form') || editable.parentElement || document.body) : document.body;
+        const buttons = Array.from(root.querySelectorAll('button'));
+        const candidate = buttons.find(btn => {
+            const title = (btn.getAttribute('title') || '').trim();
+            const text = (btn.innerText || '').trim();
+            return title.includes('上传参考素材') || text === '参考' || text === '素材';
+        });
+        if (!candidate) return 'NOT_FOUND';
+        candidate.click();
+        return 'OK_JS';
+    }''')
+    print(f"  参考素材面板兜底: {fallback}")
+    return fallback.startswith('OK')
+
+async def upload_reference_media(page, file_path: str, media_kind: str) -> bool:
+    """
+    上传参考素材。优先直连 input[type=file]，避免依赖“从本地上传”文案。
+    media_kind: 'image' | 'video'
+    """
+    expect_token = 'video' if media_kind == 'video' else 'image'
+
+    file_inputs = page.locator('input[type="file"]')
+    input_count = await file_inputs.count()
+    for idx in range(input_count):
+        locator = file_inputs.nth(idx)
+        try:
+            accept = (await locator.get_attribute('accept')) or ''
+            is_hidden = await locator.evaluate(
+                '''el => {
+                    const s = window.getComputedStyle(el);
+                    return s.display === 'none' || s.visibility === 'hidden';
+                }'''
+            )
+            if accept and expect_token not in accept.lower():
+                continue
+            await locator.set_input_files(file_path, timeout=10000)
+            print(f"  ✅ 通过 file input 上传成功: index={idx}, accept={accept or '*/*'}, hidden={is_hidden}")
+            return True
+        except Exception as e:
+            print(f"  ⚠️ file input[{idx}] 上传失败: {e}")
+
+    print("  ℹ️ 未找到可直接写入的 file input，回退到 file chooser 流程")
+    candidate_texts = ['从本地上传', '本地上传', '上传']
+    for text in candidate_texts:
+        try:
+            async with page.expect_file_chooser(timeout=5000) as fc_info:
+                clicked = await safe_click(page, page.locator(f'text={text}').first, f'{text}入口', timeout=3000)
+                if not clicked:
+                    continue
+            chooser = await fc_info.value
+            await chooser.set_files(file_path)
+            print(f"  ✅ 通过 file chooser 上传成功: {text}")
+            return True
+        except Exception:
+            continue
+
+    return False
+
+async def wait_for_reference_media_ready(page, media_kind: str, timeout_ms: int = 300000) -> bool:
+    """等待参考素材缩略图或重传入口出现。"""
+    step_ms = 5000
+    expect_video = media_kind == 'video'
+    loops = max(timeout_ms // step_ms, 1)
+    print("  ⏳ 等待上传完成...")
+    for wait_i in range(loops):
+        await page.wait_for_timeout(step_ms)
+        upload_status = await page.evaluate(r'''([expectVideo]) => {
+            const text = document.body.innerText || '';
+            const isUploading = text.includes('上传中') || text.includes('uploading') || /\b\d{1,3}%\b/.test(text);
+            const confirmBtn = Array.from(document.querySelectorAll('button')).find(btn => (btn.innerText || '').trim() === '确认');
+            const confirmDisabled = confirmBtn ? (confirmBtn.hasAttribute('disabled') || btnHasSpinner(confirmBtn)) : null;
+
+            const editable = document.querySelector('div[contenteditable="true"]');
+            const scope = editable ? (editable.closest('form') || editable.parentElement || document.body) : document.body;
+            const hasBackgroundThumb = Array.from(document.body.querySelectorAll('*')).some(el => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 20 || rect.height < 20) return false;
+                const style = window.getComputedStyle(el);
+                if (!style.backgroundImage || style.backgroundImage === 'none') return false;
+                return rect.top > 150 && rect.top < 500 && rect.left > 450 && rect.left < 900;
+            });
+            const hasVisual = expectVideo
+                ? (!!scope.querySelector('video, img[src*="tos"], canvas') || hasBackgroundThumb)
+                : (!!scope.querySelector('img, canvas') || hasBackgroundThumb);
+            const all = Array.from(document.querySelectorAll('*'));
+            const hasLabel = all.some(el => {
+                const t = (el.innerText || '').trim();
+                if (!t) return false;
+                if (expectVideo) return t === '视频1' || t === '重新上传' || t === '替换';
+                return t === '图片1' || t === '重新上传' || t === '替换';
+            });
+            const sendBtn = Array.from(document.querySelectorAll('button')).find(btn => btn.querySelector('svg.lucide-arrow-up'));
+            const sendDisabled = sendBtn ? (sendBtn.hasAttribute('disabled') || sendBtn.getAttribute('aria-disabled') === 'true') : null;
+
+            if (hasVisual || hasLabel) return `DONE|sendDisabled=${sendDisabled}|confirmDisabled=${confirmDisabled}`;
+            if (isUploading || confirmDisabled) return 'UPLOADING';
+            return `WAITING|sendDisabled=${sendDisabled}|confirmDisabled=${confirmDisabled}`;
+
+            function btnHasSpinner(btn) {
+                return !!btn.querySelector('svg, [class*="spin"], [class*="loading"], [class*="loader"]');
+            }
+        }''', [expect_video])
+
+        if upload_status.startswith('DONE'):
+            print(f"  ✅ 上传完成! {upload_status} (elapsed: {(wait_i + 1) * step_ms // 1000}s)")
+            return True
+        if upload_status == 'UPLOADING':
+            continue
+        if upload_status.startswith('WAITING|sendDisabled=false') and wait_i >= 11:
+            print(f"  ⚠️ 上传完成信号不稳定，按可提交状态继续: {upload_status} (elapsed: {(wait_i + 1) * step_ms // 1000}s)")
+            return True
+        if wait_i > 0 and wait_i % 6 == 0:
+            print(f"    ⏳ 等待中... {upload_status} ({(wait_i + 1) * step_ms // 1000}s)")
+    return False
+
+async def collect_editor_state(page):
+    """收集 dry-run 末态，便于判断表单是否可提交。"""
+    return await page.evaluate('''() => {
+        const editable = document.querySelector('div[contenteditable="true"]');
+        const scope = editable ? (editable.closest('form') || editable.parentElement || document.body) : document.body;
+        const sendBtn = Array.from(document.querySelectorAll('button')).find(btn => btn.querySelector('svg.lucide-arrow-up'));
+        const promptText = editable ? (editable.innerText || '').trim() : '';
+        const hasBackgroundThumb = Array.from(document.body.querySelectorAll('*')).some(el => {
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 20 || rect.height < 20) return false;
+            const style = window.getComputedStyle(el);
+            if (!style.backgroundImage || style.backgroundImage === 'none') return false;
+            return rect.top > 150 && rect.top < 500 && rect.left > 450 && rect.left < 900;
+        });
+        return {
+            promptLength: promptText.length,
+            hasImageThumb: !!scope.querySelector('img'),
+            hasVideoThumb: !!scope.querySelector('video'),
+            hasCanvasThumb: !!scope.querySelector('canvas'),
+            hasBackgroundThumb,
+            hasReplaceAction: Array.from(document.querySelectorAll('*')).some(el => {
+                const t = (el.innerText || '').trim();
+                return t === '重新上传' || t === '替换';
+            }),
+            sendDisabled: sendBtn ? (sendBtn.hasAttribute('disabled') || sendBtn.getAttribute('aria-disabled') === 'true') : null,
+            sendPresent: !!sendBtn,
+        };
+    }''')
+
 async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: str = "Seedance 2.0", dry_run: bool = False, ref_video: str = None, ref_image: str = None):
     global DEBUG_SCREENSHOTS
     DEBUG_SCREENSHOTS = dry_run
+    ref_video_ready = False
     if ref_image:
         mode_label = "I2V (图生视频)"
     elif ref_video:
@@ -106,7 +338,8 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
         # === Step 3: 登录验证 ===
         print("🔍 [Step 3] Checking login status...")
         content = await page.content()
-        is_logged_in = '开始创作' in content or '登录' not in content
+        # 新 UI: 页面 HTML 中总含 "登录" 文字(在属性中), 改用检测问候语或导航元素
+        is_logged_in = '小云雀助你' in content or '新对话' in content
         if is_logged_in:
             print("  ✅ LOGIN_SUCCESS")
         else:
@@ -114,30 +347,54 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
             await browser.close()
             return
 
-        # === Step 3.5: 点击 "+ 新建" ===
-        # 使用 Playwright locator 精确匹配左上角的按钮
-        print("🆕 [Step 3.5] Clicking '+ 新建'...")
-        await safe_click(page, page.locator('text=新建').first, '新建')
+        # === Step 3.5: 从 "Agent 模式" 下拉选择 "沉浸式短片" ===
+        print("🎬 [Step 3.5] Selecting '沉浸式短片' from mode dropdown...")
+        # 3.5a: 点击 "Agent 模式" 下拉按钮
+        mode_dropdown_opened = await safe_click(
+            page, page.locator('text=Agent 模式').first, 'Agent 模式下拉', timeout=8000
+        )
+        await page.wait_for_timeout(2000)
+        await screenshot(page, '3_5a_mode_dropdown')
+
+        if mode_dropdown_opened:
+            # 3.5b: 在下拉菜单中选择 "沉浸式短片"
+            immersive_clicked = await safe_click(
+                page, page.locator('text=沉浸式短片').first, '沉浸式短片', timeout=5000
+            )
+            if not immersive_clicked:
+                print("  ⚠️ Fallback: trying JS click for '沉浸式短片'")
+                await page.evaluate('''() => {
+                    const items = Array.from(document.querySelectorAll('*'));
+                    const el = items.find(e => {
+                        const t = (e.innerText || '').trim();
+                        return t === '沉浸式短片' && e.offsetHeight < 40 && e.offsetHeight > 10;
+                    });
+                    if (el) el.click();
+                }''')
+        else:
+            # 可能已经在沉浸式短片模式下
+            toolbar_text = await page.evaluate('''() => {
+                const el = document.querySelector('div[contenteditable="true"]');
+                return el ? 'HAS_INPUT' : 'NO_INPUT';
+            }''')
+            print(f"  ⚠️ Mode dropdown not found, toolbar status: {toolbar_text}")
+
         await page.wait_for_timeout(3000)
-        await screenshot(page, '3_5_new_page')
+        await screenshot(page, '3_5b_mode_selected')
 
         # === Step 3.6: 上传参考图片 (仅 I2V 模式) ===
         if ref_image:
             print(f"🖼️ [Step 3.6] Uploading reference image: {os.path.basename(ref_image)}")
 
-            # 点击输入区域的 "+" 按钮 (工具栏最左边)
-            # 点击输入区域的 "+" 按钮 (包含 lucide-plus SVG，在 "模式" 左侧)
-            # DOM 结构显示它和 "模式" 都在 .configButtons 容器内
+            # 点击输入区域的 "+" 按钮 (工具栏最左边, title="上传参考素材")
             plus_clicked = False
             try:
-                # 寻找包含 "模式" 文本最近的祖先，且内部有 lucide-plus 图标的按钮
-                plus_locator = page.locator('div:has(> div > span:text("模式"))').locator('..').locator('button:has(svg.lucide-plus), div[class*="uploadContainer"] button').first
-                
+                # 新 UI: 按钮有 title="上传参考素材"
+                plus_locator = page.locator('button[title="上传参考素材"]').first
                 box = await plus_locator.bounding_box()
                 if not box:
-                    # 备用方案：全局找 lucide-plus 但在 toolbar 区域内
+                    # 备用: 通过 SVG class 定位
                     plus_locator = page.locator('button:has(svg.lucide-plus)').first
-                    
                 await plus_locator.click(timeout=3000)
                 plus_clicked = True
                 print(f"  + 按钮: OK (Playwright locator)")
@@ -198,9 +455,20 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
                     for wait_i in range(30):
                         await page.wait_for_timeout(3000)
                         has_image = await page.evaluate('''() => {
-                            const container = document.querySelector('div[class*="inputContainer"]');
-                            if (!container) return false;
-                            return container.querySelector('img') !== null;
+                            // 新 UI: 检查 contenteditable 附近是否有 img
+                            const editable = document.querySelector('div[contenteditable="true"]');
+                            if (editable) {
+                                // 向上查找父容器中的 img
+                                const parent = editable.closest('div[class]') || editable.parentElement;
+                                if (parent && parent.querySelector('img')) return true;
+                            }
+                            // 兜底: 查找是否有内容为“图片1”或类似的元素(缩略图标题)
+                            const all = Array.from(document.querySelectorAll('*'));
+                            const hasPicThumb = all.some(el => {
+                                const t = el.innerText && el.innerText.trim();
+                                return t === '图片1' || t === '视频1' || (el.tagName === 'IMG' && el.src.includes('tos'));
+                            });
+                            return hasPicThumb;
                         }''')
                         if has_image:
                             print(f"  ✅ 图片上传完成 (elapsed: {(wait_i+1)*3}s)")
@@ -208,8 +476,8 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
                         if wait_i > 0 and wait_i % 5 == 0:
                             print(f"    ⏳ 等待中... ({(wait_i+1)*3}s)")
                             
-                    # 点击空白处关闭任何弹出的菜单
-                    await page.mouse.click(0, 0)
+                    # 关闭弹出菜单 (用 Escape 键，不用 mouse.click 避免误触链接)
+                    await page.keyboard.press('Escape')
 
                 except Exception as e:
                     print(f"  ❌ 图片上传失败: {e}")
@@ -217,103 +485,54 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
             await page.wait_for_timeout(2000)
             await screenshot(page, '3_6_image_uploaded')
 
-        # === Step 4: 选模式 "沉浸式短片" ===
-        # 关键: 用 Playwright locator.click() 而不是 JS .click()
-        # 因为 React 事件系统只响应真实 DOM 事件
-        print("🎬 [Step 4] Selecting mode: 沉浸式短片...")
-
-        # 4a: 点击 "模式" 下拉按钮（在工具栏里，用 text= 匹配）
-        mode_opened = await safe_click(page, page.locator('text=模式').nth(0), '模式下拉')
-        await page.wait_for_timeout(2000)
-        await screenshot(page, '4a_dropdown')
-
-        if mode_opened:
-            # 4b: 在下拉菜单中点击 "沉浸式短片"
-            # 下拉菜单中有三个选项：沉浸式短片、智能长视频、图片
-            # 需要精确点击菜单项，避免点到左侧边栏
-            # 策略：用 text= 匹配，但限定区域 (排除左侧 sidebar x<220)
-            mode_selected = await page.evaluate('''() => {
-                const items = Array.from(document.querySelectorAll('*'));
-                // 找到所有包含"沉浸式短片"的元素
-                const candidates = items.filter(el => {
-                    const text = el.innerText && el.innerText.trim();
-                    return text === '沉浸式短片' && el.offsetHeight < 50 && el.offsetHeight > 10;
-                });
-                // 按x坐标排序，优先选择靠近中间的（下拉菜单的位置）
-                candidates.sort((a, b) => {
-                    const ra = a.getBoundingClientRect();
-                    const rb = b.getBoundingClientRect();
-                    return rb.left - ra.left; // 先取 x 最大的
-                });
-                for (const el of candidates) {
-                    const rect = el.getBoundingClientRect();
-                    if (rect.left > 300) {
-                        // 通过 dispatchEvent 模拟完整的鼠标事件链
-                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
-                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true}));
-                        el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
-                        return 'selected (x=' + Math.round(rect.left) + ', y=' + Math.round(rect.top) + ')';
-                    }
-                }
-                // 返回调试信息
-                return 'NOT_FOUND: candidates=' + candidates.map(el => {
-                    const r = el.getBoundingClientRect();
-                    return '(' + Math.round(r.left) + ',' + Math.round(r.top) + ')';
-                }).join(';');
-            }''')
-            print(f"  沉浸式短片: {mode_selected}")
-            await page.wait_for_timeout(3000)
-        await screenshot(page, '4b_mode_selected')
+        # === Step 4: 已在 Step 3.5 中选择了沉浸式短片模式，跳过 ===
 
         # === Step 5: 选模型 ===
         print(f"🤖 [Step 5] Selecting model: {model}...")
 
-        # 5a: 精确点击工具栏的 "2.0 Fast" 按钮
-        # 关键约束: text.length < 15 排除匹配到整个工具栏容器
+        # 5a: 点击工具栏的模型按钮 (显示 "2.0 Fast" 或 "2.0")
+        # 关键: 不能用 Playwright text locator，因为底部卡片也含 "2.0" 文字
+        # 必须限制到工具栏区域 (y在400-550, x>800)
         model_click = await page.evaluate('''() => {
             const items = Array.from(document.querySelectorAll('*'));
             const btn = items.find(el => {
                 const text = el.innerText && el.innerText.trim();
                 if (!text || !text.includes('2.0')) return false;
-                // 关键: 文本长度 < 15，只匹配 "2.0 Fast" 这样的短文本
-                // 排除整个工具栏容器 ("沉浸式短片\\n2.0 Fast\\n参考\\n5s")
+                // 文本长度 < 15, 排除整个工具栏容器
                 if (text.length > 15) return false;
                 const rect = el.getBoundingClientRect();
-                // 工具栏区域: y > 370, x > 600, 小元素
-                return rect.top > 370 && rect.left > 600 && el.offsetHeight < 50 && el.offsetHeight > 15;
+                // 工具栏区域: y 在 400-700, x > 800, 小元素 (放宽因为图片预览导致下移)
+                return rect.top > 400 && rect.top < 700 && rect.left > 800 &&
+                       el.offsetHeight < 50 && el.offsetHeight > 15;
             });
             if (btn) {
-                btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
-                btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true}));
-                btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+                btn.click();
                 const r = btn.getBoundingClientRect();
                 return 'opened: ' + btn.innerText.trim() + ' (x=' + Math.round(r.left) + ', y=' + Math.round(r.top) + ')';
             }
             return 'NOT_FOUND';
         }''')
         print(f"  Model button: {model_click}")
+        model_btn_clicked = 'opened' in model_click
+
         await page.wait_for_timeout(2000)
         await screenshot(page, '5a_model_dropdown')
 
-        if 'opened' in model_click:
+        if model_btn_clicked:
             # 5b: 在下拉菜单中选目标模型
-            # 下拉结构:
-            #   "Seedance 2.0 Fast" (标题) + "更快更便宜的Seedance 2.0模型" (描述)
-            #   "Seedance 2.0" (标题) + "15 秒内效果无损..." (描述)
-            #   "Seedance 1.5" (标题) + "画面直出..." (描述)
-            # 关键: 标题行是纯英文/数字/空格/点，描述行含中文
+            want_fast = "Fast" in model
             model_select = await page.evaluate('''([wantFast]) => {
                 const items = Array.from(document.querySelectorAll('*'));
                 const candidates = items.filter(el => {
                     const text = el.innerText && el.innerText.trim();
                     if (!text) return false;
-                    // 只匹配纯英文+数字+空格+点的标题行，排除含中文的描述行
-                    if (!/^Seedance\s+\d/.test(text)) return false;
-                    // 不能含中文字符
+                    if (!/^Seedance/.test(text)) return false;
                     if (/[\u4e00-\u9fff]/.test(text)) return false;
                     if (el.offsetHeight > 40 || el.offsetHeight < 10) return false;
                     const rect = el.getBoundingClientRect();
-                    return rect.left > 300 && rect.left < 1100 && rect.top > 400;
+                    // 放宽高度上限到 850 避免由于顶部有预览图导致菜单向下偏移被忽略
+                    // 增加 X 轴限制 (> 900) 以过滤掉位于下方的底部 Seedance2.0 介绍卡片 (其 x 约等于 822)
+                    return rect.left > 900 && rect.left < 1100 && rect.top > 350 && rect.top < 850;
                 });
                 for (const el of candidates) {
                     const text = el.innerText.trim();
@@ -330,7 +549,7 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
                     const r = el.getBoundingClientRect();
                     return '"' + el.innerText.trim() + '"(x=' + Math.round(r.left) + ',y=' + Math.round(r.top) + ')';
                 }).join('; ');
-            }''', ["Fast" in model])
+            }''', [want_fast])
             print(f"  Model select: {model_select}")
             await page.wait_for_timeout(1500)
         await screenshot(page, '5b_model_selected')
@@ -339,128 +558,50 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
         if ref_video:
             print(f"📎 [Step 6] Uploading reference video: {os.path.basename(ref_video)}")
 
-            # 6a: 点击工具栏的 "参考" 按钮 → 弹出面板
-            # "参考" 文字可能在多处出现，用坐标限制到工具栏区域 (y>370)
-            ref_click_result = await page.evaluate('''() => {
-                const items = Array.from(document.querySelectorAll('*'));
-                const btn = items.find(el => {
-                    const text = el.innerText && el.innerText.trim();
-                    if (text !== '参考') return false;
-                    const rect = el.getBoundingClientRect();
-                    // 工具栏区域: y > 370, 小元素
-                    return rect.top > 370 && el.offsetHeight < 50 && el.offsetHeight > 10;
-                });
-                if (btn) {
-                    btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
-                    btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true}));
-                    btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
-                    const r = btn.getBoundingClientRect();
-                    return 'OK (x=' + Math.round(r.left) + ', y=' + Math.round(r.top) + ')';
-                }
-                return 'NOT_FOUND';
-            }''')
-            ref_clicked = 'OK' in ref_click_result
-            print(f"  参考按钮: {ref_click_result}")
-            await page.wait_for_timeout(3000)
-            await screenshot(page, '6a_ref_panel')
+            # 预检查并缩放视频
+            actual_video_path = await check_and_resize_video(ref_video)
+            is_temp = actual_video_path != ref_video
 
-            if ref_clicked:
-                # 6b: 在弹出面板中点击 "从本地上传" 链接
-                # 面板结构:
-                #   输入框: "请输入参考内容链接或从本地上传"
-                #   描述: "仅支持抖音、头条、西瓜，你也可以 [从本地上传]"  ← 紫色链接
-                #   按钮: [确认]
-                try:
-                    async with page.expect_file_chooser(timeout=10000) as fc_info:
-                        # 精确点击 "从本地上传" 链接 (紫色文字，在描述行中)
-                        upload_clicked = await page.evaluate('''() => {
-                            // 方式1: 找精确匹配 "从本地上传" 的元素 (最小的那个，即链接本身)
-                            const all = Array.from(document.querySelectorAll('*'));
-                            const candidates = all.filter(el => {
-                                const text = el.innerText && el.innerText.trim();
-                                if (!text) return false;
-                                // 精确匹配: 文本就是 "从本地上传" (不含其他文字)
-                                if (text === '从本地上传') return true;
-                                return false;
-                            });
-                            // 按元素大小排序，取最小的 (最精确的)
-                            candidates.sort((a, b) => {
-                                return (a.offsetWidth * a.offsetHeight) - (b.offsetWidth * b.offsetHeight);
-                            });
-                            if (candidates.length > 0) {
-                                const el = candidates[0];
-                                el.click();
-                                return 'OK_link: ' + el.tagName;
-                            }
-                            return 'NOT_FOUND';
-                        }''')
-                        print(f"  从本地上传: {upload_clicked}")
-                        if upload_clicked == 'NOT_FOUND':
-                            raise Exception("'从本地上传' link not found in popup")
+            try:
+                # 6a: 点击工具栏的“参考素材”按钮 → 弹出面板
+                panel_opened = await open_reference_material_panel(page)
+                if not panel_opened:
+                    print("  ❌ 未能打开参考素材面板")
+                    await screenshot(page, '6a_ref_panel_failed')
+                    await browser.close()
+                    return
+                await page.wait_for_timeout(2000)
+                await screenshot(page, '6a_ref_panel')
 
-                    file_chooser = await fc_info.value
-                    await file_chooser.set_files(ref_video)
-                    print(f"  ✅ 文件已选择: {os.path.basename(ref_video)}")
+                # 6b: 上传本地视频
+                uploaded = await upload_reference_media(page, actual_video_path, 'video')
+                if not uploaded:
+                    print("  ❌ 未能触发本地视频上传")
+                    await screenshot(page, '6b_ref_upload_trigger_failed')
+                    await browser.close()
+                    return
+                print(f"  ✅ 文件已选择: {os.path.basename(actual_video_path)}")
 
-                    # 等待上传: 弹窗会显示上传进度，完成后弹窗关闭，页面出现缩略图
-                    print("  ⏳ 等待上传完成...")
-                    for wait_i in range(60):  # 最多等 300 秒
-                        await page.wait_for_timeout(5000)
+                upload_ready = await wait_for_reference_media_ready(page, 'video')
+                if not upload_ready:
+                    print("  ❌ 参考视频在等待窗口内没有进入已挂载状态")
+                    await screenshot(page, '6b_ref_upload_timeout')
+                    await browser.close()
+                    return
+                ref_video_ready = True
 
-                        upload_status = await page.evaluate('''() => {
-                            // 检测1: 弹窗是否还在 (如果弹窗关闭了大概率上传完成)
-                            const popup = document.querySelector('[class*="modal"], [class*="dialog"], [role="dialog"]');
-                            const hasConfirmBtn = !!Array.from(document.querySelectorAll('*')).find(el =>
-                                el.innerText && el.innerText.trim() === '确认' &&
-                                el.offsetHeight < 50 && el.offsetHeight > 15
-                            );
+                # 关闭参考面板
+                await page.keyboard.press('Escape')
+                await page.wait_for_timeout(1000)
+                await screenshot(page, '6b_ref_uploaded')
 
-                            // 检测2: 视频缩略图元素是否出现 (带 video 标签或 img)
-                            const inputArea = document.querySelector('div[contenteditable="true"]');
-                            const hasThumb = inputArea ?
-                                (inputArea.parentElement.querySelector('video') !== null ||
-                                 inputArea.parentElement.querySelector('img[src*="tos"]') !== null) :
-                                false;
-
-                            // 检测3: 是否有上传进度指示
-                            const html = document.body.innerHTML;
-                            const isUploading = html.includes('上传中') || html.includes('uploading');
-
-                            if (hasThumb) return 'DONE';
-                            if (isUploading) return 'UPLOADING';
-                            if (!hasConfirmBtn && !popup) return 'POPUP_CLOSED';
-                            return 'WAITING';
-                        }''')
-
-                        if upload_status == 'DONE':
-                            print(f"  ✅ 上传完成! 缩略图已出现 (elapsed: {(wait_i+1)*5}s)")
-                            break
-                        elif upload_status == 'POPUP_CLOSED':
-                            print(f"  ✅ 弹窗已关闭 (elapsed: {(wait_i+1)*5}s)")
-                            break
-                        elif upload_status == 'UPLOADING':
-                            print(f"    ⏳ 上传中... ({(wait_i+1)*5}s)")
-                        elif wait_i > 0 and wait_i % 6 == 0:
-                            print(f"    ⏳ 等待中... ({(wait_i+1)*5}s)")
-
-                    # 如果弹窗还开着，尝试关闭 (点 X 按钮)
-                    await page.evaluate('''() => {
-                        // 找 X 关闭按钮
-                        const closeBtn = document.querySelector('[class*="close"], [aria-label="close"], [aria-label="关闭"]');
-                        if (closeBtn) { closeBtn.click(); return; }
-                        // 找确认按钮
-                        const all = Array.from(document.querySelectorAll('*'));
-                        const confirm = all.find(el => el.innerText && el.innerText.trim() === '确认'
-                            && el.offsetHeight < 50 && el.offsetHeight > 15);
-                        if (confirm) confirm.click();
-                    }''')
-                    await page.wait_for_timeout(2000)
-
-                except Exception as e:
-                    print(f"  ❌ 参考视频上传失败: {e}")
-
-            await page.wait_for_timeout(2000)
-            await screenshot(page, '6b_ref_uploaded')
+            finally:
+                if is_temp and os.path.exists(actual_video_path):
+                    try:
+                        os.remove(actual_video_path)
+                        print(f"  🧹 已清理临时缩放视频: {actual_video_path}")
+                    except:
+                        pass
 
         # === Step 7: 选时长 ===
         step7_label = '7' if ref_video else '6'
@@ -505,12 +646,31 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
                 const all = Array.from(document.querySelectorAll('*'));
                 const info = all.find(el => {
                     const t = el.innerText && el.innerText.trim();
-                    return t && t.includes('积分') && t.includes('秒') && el.offsetHeight < 40;
+                    // 新 UI: 顶部显示 "沉浸式短片 Seedance 2.0 Fast 按 1 秒 3 积分扣除"
+                    return t && t.includes('积分') && el.offsetHeight < 50;
                 });
                 return info ? info.innerText.trim() : 'NOT_FOUND';
             }''')
+            editor_state = await collect_editor_state(page)
+            ref_state_ok = True
+            if ref_video:
+                ref_state_ok = (
+                    ref_video_ready or
+                    editor_state['hasVideoThumb'] or
+                    editor_state['hasImageThumb'] or
+                    editor_state['hasCanvasThumb'] or
+                    editor_state['hasBackgroundThumb'] or
+                    editor_state['hasReplaceAction']
+                )
             print(f"\n✅ DRY-RUN 完成！请检查截图 step_8_DRY_RUN_FINAL.png")
             print(f"📊 底部状态栏: {status_text}")
+            print(f"🧪 表单状态: {json.dumps(editor_state, ensure_ascii=False)}")
+            if ref_video and not ref_state_ok:
+                print("❌ DRY-RUN 失败: V2V 参考视频没有出现在编辑器区域，当前流程还没跑通。")
+                await browser.close()
+                return
+            if editor_state['sendPresent'] and editor_state['sendDisabled']:
+                print("⚠️ DRY-RUN 告警: 发送按钮仍是禁用态，页面可能还没接受当前表单。")
             print(f"\n确认无误后，去掉 --dry-run 参数重新运行即可提交任务。")
             await browser.close()
             return
@@ -553,8 +713,11 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
 
         page.on('response', sniff_thread)
 
-        print("🖱️ [Step 8] Clicking '开始创作'...")
-        submit_clicked = await safe_click(page, page.locator('text=开始创作').first, '开始创作')
+        print("🖱️ [Step 8] Clicking send button (arrow)...")
+        # 新 UI: 发送按钮是右下角的箭头图标 (lucide-arrow-up)
+        submit_clicked = await safe_click(
+            page, page.locator('button:has(svg.lucide-arrow-up)').first, '发送(箭头)', timeout=5000
+        )
         await page.wait_for_timeout(5000)
         await screenshot(page, '8_submitted')
 
@@ -595,11 +758,11 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
 
         print("⏳ Polling for video on detail page...")
         mp4_url = None
-        for i in range(120):
+        for i in range(240):  # 延长至 240 次 (约 20 分钟)
             await page.wait_for_timeout(5000)
 
             # 双通道提取: DOM + 正则
-            mp4_url = await page.evaluate('''() => {
+            mp4_url = await page.evaluate(r'''() => {
                 // 通道1: <video> 标签 src
                 const v = document.querySelector('video');
                 if (v && v.src && v.src.includes('.mp4')) return v.src;
