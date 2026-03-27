@@ -1,6 +1,6 @@
 ---
 name: jianying-video-gen
-description: 使用剪映(Jianying/小云雀)的 Seedance 2.0 模型自动生成AI视频。支持文生视频(T2V)、图生视频(I2V)和参考视频生成(V2V)三种模式。当用户需要生成AI视频、使用Seedance模型创作短片、或基于参考图像/视频进行风格转换时使用此技能。需要预先配置 cookies.json 登录凭证。
+description: 使用剪映(Jianying/小云雀)的 Seedance 2.0 模型自动生成AI视频。支持文生视频(T2V)、图生视频(I2V)、参考视频生成(V2V)和向后延伸(Extend)四种模式。当用户需要生成AI视频、使用Seedance模型创作短片、基于参考图像/视频进行风格转换，或对已有结果继续延长时使用此技能。需要预先配置 cookies.json 登录凭证。
 ---
 
 # 剪映 AI 视频生成器
@@ -58,6 +58,17 @@ python3 scripts/jianying_worker.py \
   --model "Seedance 2.0"
 ```
 
+### 向后延伸 (Extend)
+
+```bash
+python3 scripts/jianying_worker.py \
+  --cookies /path/to/cookies.json \
+  --output-dir /path/to/output \
+  --extend-url 'https://xyq.jianying.com/home?tab_name=integrated-agent&thread_id=YOUR_THREAD_ID&agent_name=pippit_video_part_agent' \
+  --prompt "向后延伸，保持人物和镜头语言一致" \
+  --duration 5s
+```
+
 ### Dry-Run 模式（调试用）
 
 ```bash
@@ -77,6 +88,7 @@ python3 scripts/jianying_worker.py --cookies /path/to/cookies.json --prompt "测
 | `--model` | `Seedance 2.0` | `Seedance 2.0`, `Seedance 2.0 Fast` | 模型选择 |
 | `--ref-image` | 无 | 本地图片路径 | I2V 模式的参考图片 |
 | `--ref-video` | 无 | 本地视频路径 | V2V 模式的参考视频 |
+| `--extend-url` | 无 | thread 链接 | Extend 模式，基于已有视频继续生成 |
 | `--cookies` | `cookies.json` | 文件路径 | 剪映登录凭证路径 |
 | `--output-dir` | `.` | 目录路径 | 输出视频保存目录 |
 | `--dry-run` | false | - | 只填表不提交 |
@@ -91,7 +103,7 @@ python3 scripts/jianying_worker.py --cookies /path/to/cookies.json --prompt "测
 ## 自动化流程
 
 ```
-登录(cookies) → 选模式(沉浸式短片) → 选模型 → [上传参考素材] → 选时长 → 输入Prompt → 发送
+登录(cookies) → 选模式(沉浸式短片) → 选模型 → [上传参考素材/打开已有 thread 并点向后延伸] → 选时长 → 输入Prompt → 发送
   → 拦截 thread_id → 导航详情页 → 轮询视频 → curl 下载 MP4
 ```
 

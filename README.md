@@ -25,6 +25,7 @@
 | 🎥 **文生视频 (T2V)** | 输入文字描述，自动生成视频 |
 | 🖼️ **图生视频 (I2V)** | 上传参考图片 + 文字描述，让图片动起来 |
 | 🔄 **参考视频生成 (V2V)** | 上传参考视频 + 风格描述，生成风格转换视频 |
+| ➕ **向后延伸 (Extend)** | 打开已有生成结果，点击“向后延伸”，追加提示词并继续生成 |
 | 📥 **自动下载** | 通过 thread_id 详情页提取 CDN 链接，curl 直接下载 |
 | 🔐 **Cookie 登录** | 免密登录，支持自定义 cookies 路径 |
 | 🧪 **Dry-Run 调试** | 填写表单但不提交，生成截图供检查 |
@@ -112,6 +113,15 @@ python3 jianying-video-gen/scripts/jianying_worker.py \
   --model "Seedance 2.0"
 ```
 
+### ➕ 向后延伸 (Extend)
+
+```bash
+python3 jianying-video-gen/scripts/jianying_worker.py \
+  --extend-url 'https://xyq.jianying.com/home?tab_name=integrated-agent&thread_id=YOUR_THREAD_ID&agent_name=pippit_video_part_agent' \
+  --prompt "向后延伸，保持人物和镜头语言一致" \
+  --duration 5s
+```
+
 ## 📋 参数说明
 
 | 参数 | 默认值 | 可选值 | 说明 |
@@ -122,6 +132,7 @@ python3 jianying-video-gen/scripts/jianying_worker.py \
 | `--model` | `Seedance 2.0` | `Seedance 2.0` `Seedance 2.0 Fast` | 模型选择 |
 | `--ref-image` | — | 本地图片文件路径 | 参考图片 (I2V 模式) |
 | `--ref-video` | — | 本地视频文件路径 | 参考视频 (V2V 模式) |
+| `--extend-url` | — | thread 详情页链接 | 向后延伸模式，基于已有视频继续生成 |
 | `--cookies` | `cookies.json` | 文件路径 | 登录凭证路径 |
 | `--output-dir` | `.` | 目录路径 | 视频输出目录 |
 | `--dry-run` | `false` | — | 仅填表不提交 |
@@ -158,14 +169,18 @@ graph LR
     E -->|是| F[📎 点击参考]
     F --> G[🧰 ffprobe/ffmpeg 预处理]
     G --> H[📤 上传参考视频]
-    E -->|否| I[⏱️ 选时长]
-    H --> I
-    I --> J[💬 输入Prompt]
-    J --> K[🚀 提交生成]
-    K --> L[🎯 拦截 thread_id]
-    L --> M[📄 导航详情页]
-    M --> N[⏳ 轮询视频]
-    N --> O[📥 curl 下载 MP4]
+    E -->|否| I{Extend?}
+    I -->|是| J[🧵 打开已有 thread]
+    J --> K[➕ 点击向后延伸]
+    I -->|否| L[⏱️ 选时长]
+    H --> L
+    K --> L
+    L --> M[💬 输入Prompt]
+    M --> N[🚀 提交生成]
+    N --> O[🎯 拦截 thread_id]
+    O --> P[📄 导航详情页]
+    P --> Q[⏳ 轮询视频]
+    Q --> R[📥 curl 下载 MP4]
 ```
 
 ## 🎨 提示词示例
