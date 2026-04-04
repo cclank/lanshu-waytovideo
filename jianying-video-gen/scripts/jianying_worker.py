@@ -158,6 +158,27 @@ async def submit_and_capture_thread(page, screenshot_name: str):
                 thread_id = m.group(1)
                 print(f"  🎯 Found thread_id in HTML: {thread_id}")
 
+        # Last resort: navigate to integrated-agent and find latest task
+        if not thread_id:
+            print("  ⚠️ Trying to find latest task from task list...")
+            await page.goto("https://xyq.jianying.com/home?tab_name=integrated-agent&agent_name=pippit_video_part_agent", wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
+            
+            # Look for links with thread_id
+            html = await page.content()
+            links = re.findall(r'href="[^"]*thread_id=([0-9a-f-]{36})', html)
+            if links:
+                thread_id = links[0]
+                print(f"  🎯 Found thread_id from task list: {thread_id}")
+            
+            # Check localStorage for thread_id
+            if not thread_id:
+                storage = await page.evaluate("() => JSON.stringify(localStorage)")
+                m = re.search(r'"thread_id"\s*:\s*"([0-9a-f-]{36})"', storage)
+                if m:
+                    thread_id = m.group(1)
+                    print(f"  🎯 Found thread_id in localStorage: {thread_id}")
+
         if not thread_id:
             print(f"  ⚠️ [DEBUG] current url: {page.url}")
             await page.screenshot(path='FAILED_submit.png')
@@ -524,32 +545,39 @@ async def collect_editor_state(page):
     }''')
 
 async def read_toolbar_model_label(page) -> str:
-    """读取工具栏当前显示的模型标签（宽松版，不限制坐标）。"""
+    """读取当前激活模型 —— 以积分状态栏文字为准（最可靠），其次读工具栏按钮。"""
     return await page.evaluate('''() => {
-        const items = Array.from(document.querySelectorAll('*'));
-        const candidates = items.filter(el => {
-            const text = (el.innerText || '').trim();
-            if (!text) return false;
-            // 匹配所有可能的模型标签形式
-            const isModelText = (
-                text === '2.0' || text === '2.0 Fast' ||
-                text === 'Seedance 2.0' || text === 'Seedance 2.0 Fast' ||
-                text === 'Seedance2.0' || text === 'Seedance2.0Fast' ||
-                text === 'Seedance2.0 Fast'
-            );
-            if (!isModelText) return false;
-            // 元素必须可见
-            const r = el.getBoundingClientRect();
-            return r.width > 0 && r.height > 0 && el.offsetHeight < 80;
+        const all = Array.from(document.querySelectorAll('*'));
+
+        // 策略1: 读积分状态栏 "沉浸式短片 Seedance 2.0 Fast 按 1 秒 X 积分扣除"
+        // 这是页面上最权威的当前模型指示器
+        const statusBar = all.find(el => {
+            const t = (el.innerText || '').trim();
+            return t.includes('积分') && t.includes('Seedance') && el.offsetHeight < 60;
         });
-        if (candidates.length === 0) return '';
-        // 优先选工具栏区域（bottom > 400）的元素，否则取第一个
-        const toolbar = candidates.find(el => {
+        if (statusBar) {
+            const t = statusBar.innerText.trim();
+            const hasFast = t.includes('Fast');
+            return hasFast ? 'Seedance 2.0 Fast' : 'Seedance 2.0';
+        }
+
+        // 策略2: 读工具栏按钮（不是下拉菜单内的选项）
+        // 工具栏按钮一般是小按钮，在输入框上方，显示 "2.0" 或 "2.0 fast"
+        const toolbarBtn = all.find(el => {
+            const t = (el.innerText || '').trim();
+            const isLabel = t === '2.0' || t === '2.0 fast' || t === '2.0 Fast';
+            if (!isLabel) return false;
             const r = el.getBoundingClientRect();
-            return r.top > 400 && r.top < 700;
+            // 工具栏按钮：位置在右侧，高度小
+            return r.width > 0 && r.height > 0 && r.height < 40 && r.left > 300;
         });
-        const el = toolbar || candidates[0];
-        return el.innerText.trim();
+        if (toolbarBtn) {
+            const t = toolbarBtn.innerText.trim();
+            const hasFast = t.toLowerCase().includes('fast');
+            return hasFast ? 'Seedance 2.0 Fast' : 'Seedance 2.0';
+        }
+
+        return '';
     }''')
 
 async def click_extend_button(page) -> bool:
@@ -768,11 +796,9 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
             await browser.close()
             return
 
-        # === Step 3.5: 根据目标模型选择对应的 Agent 模式 ===
-        # - Seedance 2.0 (非Fast) → 点击首页 "Seedance 2.0 首发试用" 快捷卡片，进入专属对话
-        # - Seedance 2.0 Fast     → 从 Agent 模式下拉选择 "沉浸式短片"
+        # === Step 3.5: 统一走沉浸式短片表单模式，模型由 Step 5 下拉菜单选择 ===
         want_fast_mode = "Fast" in model
-        if not want_fast_mode:
+        if False:  # 不再走 Agent 卡片模式
             print("🎬 [Step 3.5] Selecting 'Seedance 2.0' mode (non-Fast) via quick card...")
             # 点击首页底部的 "Seedance 2.0 首发试用" 快捷入口卡片
             s2_card_clicked = await page.evaluate('''() => {
@@ -976,40 +1002,81 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
         print(f"🤖 [Step 5] Selecting model: {model}...")
         want_fast = "Fast" in model
 
+        # Seedance 2.0 非Fast模式已通过 Step 3.5 点击卡片进入 Agent 对话模式，该模式没有模型下拉，直接跳过
+        # 检测当前是否进入了 Agent 对话模式（查找“自动”按钮或“与综合助手对话”提示）
+        is_agent_mode = await page.evaluate('''() => {
+            const all = Array.from(document.querySelectorAll('*'));
+            return all.some(el => {
+                const t = (el.innerText || '').trim();
+                return (t === '\u81ea\u52a8' || t.includes('\u4e0e\u7efc\u5408\u52a9\u624b\u5bf9\u8bdd'))
+                    && el.getBoundingClientRect().width > 0;
+            });
+        }''')
+        skip_model_select = is_agent_mode and not want_fast_mode
+        if skip_model_select:
+            print("  ⏭️ 检测到 Agent 对话模式，跳过模型/时长选择（将在 prompt 中指定）")
+
         async def try_select_model_once():
             """点击工具栏模型按钮并在下拉中选择目标，返回是否点击成功"""
+            # 策略：精确匹配工具栏上的模型小按钮（文字为 '2.0 fast' 或 '2.0'，宽度较小，位于工具栏区域）
             clicked = await page.evaluate('''() => {
-                const items = Array.from(document.querySelectorAll('*'));
-                const btn = items.find(el => {
-                    const text = (el.innerText || '').trim();
+                const items = Array.from(document.querySelectorAll('div, span, button'));
+                // 策略1: 精确匹配工具栏小按钮 (text 是 '2.0 fast' 或 '2.0', 宽度<150, 高度<40)
+                let btn = items.find(el => {
+                    const text = (el.innerText || '').trim().toLowerCase();
                     const r = el.getBoundingClientRect();
-                    return (text === 'Seedance 2.0' || text === '2.0' || text === '2.0 Fast' || text === 'Seedance 2.0 Fast'
-                        || text === 'Seedance2.0' || text === 'Seedance2.0Fast')
-                        && (el.tagName === 'DIV' || el.tagName === 'SPAN') && r.left > 300 && r.top > 300
-                        && r.height < 60 && r.height > 10;
+                    return (text === '2.0 fast' || text === '2.0')
+                        && r.width > 20 && r.width < 150 && r.height > 5 && r.height < 40
+                        && r.left > 300;
                 });
-                if (btn) { btn.click(); return 'OPENED: ' + btn.innerText.trim(); }
+                // 策略2: 查找包含下拉箭头的模型按钮
+                if (!btn) {
+                    btn = items.find(el => {
+                        const text = (el.innerText || '').trim();
+                        const r = el.getBoundingClientRect();
+                        return (text.includes('2.0') && !text.includes('\u6c89\u6d78') && !text.includes('\u5168\u80fd'))
+                            && r.width > 20 && r.width < 200 && r.height > 5 && r.height < 50
+                            && r.left > 300 && r.top > 400;
+                    });
+                }
+                if (btn) {
+                    const r = btn.getBoundingClientRect();
+                    return JSON.stringify({text: btn.innerText.trim(), x: r.left + r.width/2, y: r.top + r.height/2});
+                }
                 return 'NOT_FOUND';
             }''')
+            if 'NOT_FOUND' in clicked:
+                print(f"  Model btn click: NOT_FOUND")
+                return False
+            import json as _json
+            btn_info = _json.loads(clicked)
+            print(f"  Model btn found: '{btn_info['text']}' at ({btn_info['x']:.0f}, {btn_info['y']:.0f})")
+            # 用 Playwright 原生 mouse.click 点击（比 JS click 更可靠）
+            await page.mouse.click(btn_info['x'], btn_info['y'])
+            print(f"  Model btn click: OPENED via mouse.click")
+            clicked = 'OPENED: ' + btn_info['text']
             print(f"  Model btn click: {clicked}")
             if 'NOT_FOUND' in clicked:
                 return False
             await page.wait_for_timeout(2000)  # 等下拉完全展开
+            await screenshot(page, '5_dropdown_open')  # 截图看下拉是否打开
 
-            # 关键修复：用精确文本节点匹配，避免 innerText 把子元素描述文字也纳入导致被中文过滤掉
+            # 在下拉菜单中找到目标模型选项并点击
+            # 下拉菜单标题是 "模型选择"，包含 Seedance 2.0 Fast / Seedance 2.0 / Seedance 1.5 三个选项
             selected = await page.evaluate('''([wantFast]) => {
                 const targetText = wantFast ? 'Seedance 2.0 Fast' : 'Seedance 2.0';
                 const all = Array.from(document.querySelectorAll('div, span, p, li'));
 
-                // 策略1：找 textContent 精确等于目标的最小元素（比如标题 span）
+                // 策略1: 找叶子 SPAN 的 innerText 精确等于目标的元素
                 let el = all.find(e => {
-                    const t = e.textContent.trim();
+                    const t = (e.innerText || '').trim();
                     if (t !== targetText) return false;
                     const r = e.getBoundingClientRect();
-                    return r.width > 0 && r.left > 300 && r.top > 200;
+                    return r.width > 0 && r.top > 300 && r.top < 750 && r.left > 300
+                        && e.childElementCount <= 1 && r.height < 30;
                 });
 
-                // 策略2：找以目标开头、但排除对手模型名的最小元素（高度限制在容器内）
+                // 策略2: 放宽 - 找包含目标文本但不含对手模型名的小元素
                 if (!el) {
                     el = all.find(e => {
                         const t = (e.innerText || '').trim();
@@ -1017,41 +1084,42 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
                         const hasFast = t.includes('Fast');
                         if (wantFast !== hasFast) return false;
                         const r = e.getBoundingClientRect();
-                        return r.left > 300 && r.top > 200 && e.offsetHeight < 100;
+                        return r.left > 300 && r.top > 300 && r.top < 750 && r.height < 40;
                     });
                 }
 
                 if (!el) {
-                    // 收集所有候选并输出调试信息
                     const debug = all.filter(e => {
                         const t = (e.textContent || '').trim();
-                        return t.includes('Seedance') && e.getBoundingClientRect().left > 300;
-                    }).slice(0, 5).map(e => '"' + e.textContent.trim().substring(0, 30) + '"').join('; ');
-                    return 'NOT_FOUND_IN_DROPDOWN. Debug candidates: ' + debug;
+                        const r = e.getBoundingClientRect();
+                        return t.includes('Seedance') && r.left > 300 && r.top < 700;
+                    }).slice(0, 8).map(e => {
+                        const r = e.getBoundingClientRect();
+                        return '"' + e.textContent.trim().substring(0, 30) + '" y=' + Math.round(r.top);
+                    }).join('; ');
+                    return 'NOT_FOUND_IN_DROPDOWN. Debug: ' + debug;
                 }
 
-                // 向上找可点击的父容器（不超出合理范围）
-                let clickTarget = el;
-                for (let i = 0; i < 5; i++) {
-                    const p = clickTarget.parentElement;
-                    if (!p || p === document.body) break;
-                    const r = p.getBoundingClientRect();
-                    if (r.height > 120) break;
-                    clickTarget = p;
-                }
-                clickTarget.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
-                clickTarget.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
-                clickTarget.click();
-                return 'SELECTED: ' + el.textContent.trim().substring(0, 30);
+                const r = el.getBoundingClientRect();
+                return JSON.stringify({found: true, text: el.textContent.trim().substring(0, 30), x: r.left + r.width/2, y: r.top + r.height/2});
             }''', [want_fast])
-            print(f"  Model dropdown select: {selected}")
-            return 'SELECTED' in selected
+            if 'NOT_FOUND' in selected:
+                print(f"  Model dropdown select: {selected}")
+                return False
+            option_info = _json.loads(selected)
+            if option_info.get('found'):
+                print(f"  Model dropdown option: '{option_info['text']}' at ({option_info['x']:.0f}, {option_info['y']:.0f})")
+                await page.mouse.click(option_info['x'], option_info['y'])
+                print(f"  Model dropdown select: SELECTED via mouse.click")
+                await page.wait_for_timeout(1000)
+                return True
+            return False
 
         await screenshot(page, '5a_model_dropdown')
 
         # 最多尝试3次，每次选完等待500ms再验证工具栏标签
-        model_confirmed = False
-        for attempt in range(3):
+        model_confirmed = skip_model_select  # 如果跳过则直接认为确认
+        for attempt in range(0 if skip_model_select else 3):
             ok = await try_select_model_once()
             await page.wait_for_timeout(800)
             current_label = await read_toolbar_model_label(page)
@@ -1133,40 +1201,48 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
 
         # === Step 7: 选时长及比例 ===
         step7_label = '7' if ref_video else '6'
-        print(f"⏱️ [Step {step7_label}] Selecting duration: {duration} (ratio fallback via prompt)...")
         
         # 将比例合并至 Prompt 的方案 (因为新 UI 消失了原生组件)，确保最终一定生效
         if ratio and ratio not in prompt:
             prompt = f"[{ratio}] {prompt}"
+
+        if skip_model_select:
+            # Agent 对话模式：时长和比例在 prompt 中指定
+            print(f"⏱️ [Step {step7_label}] Agent 模式，时长和比例将在 prompt 中指定")
+            if duration and duration not in prompt:
+                prompt = f"[{duration}] {prompt}"
+        else:
+            print(f"⏱️ [Step {step7_label}] Selecting duration: {duration} (ratio fallback via prompt)...")
             
-        dur_click_result = await page.evaluate('''() => {
+        if not skip_model_select:
+            dur_click_result = await page.evaluate('''() => {
             const all = Array.from(document.querySelectorAll('*'));
             const btn = all.find(el => {
-                const text = (el.innerText || '').trim();
-                const r = el.getBoundingClientRect();
-                return /^\\d+s$/.test(text) && r.left > 300 && r.height > 5 && r.height < 50;
+            const text = (el.innerText || '').trim();
+            const r = el.getBoundingClientRect();
+            return /^\\d+s$/.test(text) && r.left > 300 && r.height > 5 && r.height < 50;
             });
             if(btn) {
-                btn.click();
-                return 'clicked';
+            btn.click();
+            return 'clicked';
             }
             return 'not found';
-        }''')
-        
-        await page.wait_for_timeout(1500)
-        await screenshot(page, f'{step7_label}a_duration_dropdown')
+            }''')
 
-        if dur_click_result == 'clicked':
-            try:
-                # 尝试选具体的时长
-                dur_item = page.locator(f'text=/^{duration}$/').locator('visible=true').first
-                if await dur_item.count() > 0:
-                    await dur_item.click(timeout=3000)
-                    print(f"  ✅ 时长选择: {duration}")
-            except Exception as e:
-                print(f"  ⚠️ 时长选择兜底失败: {e}")
-            await page.wait_for_timeout(1000)
-        await screenshot(page, f'{step7_label}b_duration_selected')
+            await page.wait_for_timeout(1500)
+            await screenshot(page, f'{step7_label}a_duration_dropdown')
+
+            if dur_click_result == 'clicked':
+                try:
+                    # 尝试选具体的时长
+                    dur_item = page.locator(f'text=/^{duration}$/').locator('visible=true').first
+                    if await dur_item.count() > 0:
+                        await dur_item.click(timeout=3000)
+                        print(f"  ✅ 时长选择: {duration}")
+                except Exception as e:
+                    print(f"  ⚠️ 时长选择兜底失败: {e}")
+                await page.wait_for_timeout(1000)
+            await screenshot(page, f'{step7_label}b_duration_selected')
 
         # === Step 8: 注入 Prompt ===
         step8_label = '8' if ref_video else '7'
@@ -1184,6 +1260,31 @@ async def run(prompt: str, duration: str = "10s", ratio: str = "横屏", model: 
         print(f"  Inject: {inject_result}")
         await page.wait_for_timeout(1000)
         await screenshot(page, f'{step8_label}_prompt')
+
+        # === 模型二次确认：仅对 Fast 模式有效，Seedance 2.0 已通过卡片确认无需重选 ===
+        if not want_fast_mode:
+            print("⏭️ [Model Re-confirm] Seedance 2.0 Agent 模式，跳过模型二次确认")
+        else:
+            # Fast 模式才需要二次确认
+            print(f"🤖 [Model Re-confirm] Re-selecting model after prompt: {model}...")
+            model_reconfirmed = False
+            for attempt in range(5):
+                ok = await try_select_model_once()
+                await page.wait_for_timeout(800)
+                current_label = await read_toolbar_model_label(page)
+                print(f"  [Re-confirm attempt {attempt+1}] toolbar label: '{current_label}'")
+                if current_label:
+                    current_is_fast = 'Fast' in current_label
+                    if current_is_fast == want_fast:
+                        print(f"  ✅ 模型最终确认: {current_label}")
+                        model_reconfirmed = True
+                        break
+                    else:
+                        print(f"  ⚠️ 仍不符 (want_fast={want_fast}, got '{current_label}')，再试...")
+                        await page.wait_for_timeout(500)
+            if not model_reconfirmed:
+                print(f"  ❌ 模型二次确认失败，将以当前模型提交")
+            await screenshot(page, f'model_reconfirm')
 
         # === Step 8: 验证/提交 ===
         if dry_run:
